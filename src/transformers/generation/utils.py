@@ -1762,7 +1762,8 @@ class GenerationMixin:
             input_ids = self.heal_tokens(input_ids, tokenizer)
 
         if streamer is not None:
-            streamer.put(input_ids.cpu())
+            # streamer.put(input_ids.cpu())
+            streamer.put(input_ids)
 
         # 6. Prepare `max_length` depending on other stopping criteria.
         input_ids_length = input_ids.shape[-1]
@@ -3028,7 +3029,8 @@ class GenerationMixin:
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             if streamer is not None:
-                streamer.put(next_tokens.cpu())
+                # streamer.put(next_tokens.cpu())
+                streamer.put(next_tokens)
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,

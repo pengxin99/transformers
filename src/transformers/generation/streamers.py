@@ -34,7 +34,7 @@ class BaseStreamer:
         """Function that is called by `.generate()` to signal the end of generation"""
         raise NotImplementedError()
 
-
+import torch
 class TextStreamer(BaseStreamer):
     """
     Simple text streamer that prints the token(s) to stdout as soon as entire words are formed.
@@ -69,7 +69,8 @@ class TextStreamer(BaseStreamer):
         ```
     """
 
-    def __init__(self, tokenizer: "AutoTokenizer", skip_prompt: bool = False, **decode_kwargs):
+    def __init__(self, tokenizer: "AutoTokenizer", skip_prompt: bool = False, print_freq = 4, **decode_kwargs):
+        # breakpoint()
         self.tokenizer = tokenizer
         self.skip_prompt = skip_prompt
         self.decode_kwargs = decode_kwargs
@@ -78,6 +79,7 @@ class TextStreamer(BaseStreamer):
         self.token_cache = []
         self.print_len = 0
         self.next_tokens_are_prompt = True
+        self.print_token_freq = print_freq
 
     def put(self, value):
         """
@@ -93,8 +95,16 @@ class TextStreamer(BaseStreamer):
             return
 
         # Add the new token to the cache and decodes the entire thing.
-        self.token_cache.extend(value.tolist())
-        text = self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
+        # self.token_cache.extend(value)
+        if self.token_cache == []:
+            self.token_cache = value
+        else:
+            self.token_cache = torch.cat((self.token_cache, value), dim=-1)
+        if len(self.token_cache) < self.print_token_freq:
+            return
+        # print("\n-------- add token to selftoken_cache: ", value.tolist())
+        text = self.tokenizer.decode(self.token_cache.tolist(), **self.decode_kwargs)
+        # print("-------- text: ", text)
 
         # After the symbol for a new line, we flush the cache.
         if text.endswith("\n"):
@@ -105,13 +115,20 @@ class TextStreamer(BaseStreamer):
         elif len(text) > 0 and self._is_chinese_char(ord(text[-1])):
             printable_text = text[self.print_len :]
             self.print_len += len(printable_text)
+            self.print_len = 0
+            self.token_cache = []
         # Otherwise, prints until the last space char (simple heuristic to avoid printing incomplete words,
         # which may change with the subsequent token -- there are probably smarter ways to do this!)
         else:
-            printable_text = text[self.print_len : text.rfind(" ") + 1]
+            # printable_text = text[self.print_len : text.rfind(" ") + 1]
+            printable_text = text[self.print_len : ]
             self.print_len += len(printable_text)
+            self.print_len = 0
+            self.token_cache = []
 
+        # print("-------- printable_text: ", printable_text)
         self.on_finalized_text(printable_text)
+        # print("-------- printable_text done")
 
     def end(self):
         """Flushes any remaining cache and prints a newline to stdout."""
