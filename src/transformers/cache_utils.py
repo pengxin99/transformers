@@ -819,6 +819,7 @@ class SinkCache(Cache):
     """
 
     def __init__(self, window_length: int, num_sink_tokens: int) -> None:
+        # breakpoint()
         super().__init__()
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
@@ -902,6 +903,7 @@ class SinkCache(Cache):
         """
         # Optional kwargs for `SinkCache` -- needed on models using RoPE. `partial_rotation_size` is used on models
         # with partially rotated position embeddings, like Phi or Persimmon.
+        # breakpoint()
         sin = cache_kwargs.get("sin")
         cos = cache_kwargs.get("cos")
         partial_rotation_size = cache_kwargs.get("partial_rotation_size")
@@ -926,6 +928,11 @@ class SinkCache(Cache):
                     self._cos_cache = torch.cat([self._cos_cache, cos[0, ...]], dim=0)
                     self._sin_cache = torch.cat([self._sin_cache, sin[0, ...]], dim=0)
 
+        # print("=== layer_idx, key_states, self.get_seq_length(layer_idx): ", layer_idx, key_states.shape, self.get_seq_length(layer_idx))
+        # print("=== self.key_cache: ", len(self.key_cache))
+        # if len(self.key_cache) > 0:
+        #     print("\t=== self.key_cache: ", self.key_cache[0].shape)
+
         # [bsz, num_heads, seq_len, head_dim]
         if len(self.key_cache) <= layer_idx:
             # Empty cache
@@ -939,6 +946,7 @@ class SinkCache(Cache):
 
         else:
             # Shifting cache
+            # breakpoint()
             keys_to_keep = self.key_cache[layer_idx][
                 :, :, -self.window_length + self.num_sink_tokens + key_states.shape[-2] :
             ]
@@ -1009,6 +1017,10 @@ class StaticCache(Cache):
         super().__init__()
         self.max_batch_size = max_batch_size
         self.max_cache_len = config.max_position_embeddings if max_cache_len is None else max_cache_len
+
+        # YC dbg
+        # self.max_cache_len = (self.max_cache_len + 511) // 512 * 512  # 512 align for cacheline
+
         # Some model define a custom `head_dim` != config.hidden_size // config.num_attention_heads
         self.head_dim = (
             config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
@@ -1024,6 +1036,7 @@ class StaticCache(Cache):
         # Note: There will be significant perf decrease if switching to use 5D tensors instead.
         cache_shape = (max_batch_size, self.num_key_value_heads, self.max_cache_len, self.head_dim)
         for idx in range(config.num_hidden_layers):
+            # YC dbg
             new_layer_key_cache = torch.zeros(cache_shape, dtype=self.dtype, device=device)
             new_layer_value_cache = torch.zeros(cache_shape, dtype=self.dtype, device=device)
             # Notes:
@@ -1040,6 +1053,10 @@ class StaticCache(Cache):
                 torch._dynamo.mark_static_address(new_layer_value_cache)
             self.key_cache.append(new_layer_key_cache)
             self.value_cache.append(new_layer_value_cache)
+
+        self.sparseMask = None
+        self.upperMask = None
+        self.downMask = None
 
     def update(
         self,
@@ -1088,6 +1105,24 @@ class StaticCache(Cache):
                 v_out[:, :, cache_position] = value_states
 
         return k_out, v_out
+    
+    # YC dbg
+    def temp_cleanup(
+        self,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        self.key_cache[layer_idx] = self.key_cache[layer_idx].to('cpu')
+        self.value_cache[layer_idx] = self.value_cache[layer_idx].to('cpu')
+
+    # YC dbg
+    def temp_revive(
+        self,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        self.key_cache[layer_idx] = self.key_cache[layer_idx].to('xpu')
+        self.value_cache[layer_idx] = self.value_cache[layer_idx].to('xpu')
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states that were seen by the model."""

@@ -54,6 +54,11 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
+# YC dbg
+def flushXPU():
+    pass
+    # torch.xpu.synchronize()
+    # torch.xpu.empty_cache()
 
 def _prepare_4d_causal_attention_mask_with_cache_position(
     attention_mask: torch.Tensor,
@@ -336,7 +341,7 @@ class LlamaAttention(nn.Module):
                 "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
                 "when creating this class."
             )
-
+        self.total_tokens_ypx = 0
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -346,6 +351,11 @@ class LlamaAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
+        self.cnt = 0
+        self.kv_len = 0
+        self.sparseMask = None
+        self.upperMask = None
+        self.downMask = None
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -574,13 +584,108 @@ class LlamaFlashAttention2(LlamaAttention):
 
         return attn_output, attn_weights, past_key_value
 
-
 class LlamaSdpaAttention(LlamaAttention):
     """
     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
     `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
     SDPA API.
     """
+    def get_grouped_mask(self, mask, block_size, neg_inf):
+        ori_shape = mask.shape
+        assert(len(ori_shape) == 2)
+
+        kv_aligned_len = ((ori_shape[1] // block_size)+31)//32*32
+        q_len = ori_shape[0] // block_size
+        mask_group = torch.zeros((q_len, kv_aligned_len), dtype=torch.int8, device=mask.device) - 1
+    
+        mask_tmp = mask.view(ori_shape[0] // block_size , block_size, ori_shape[1] // block_size, block_size)
+        for i in range(ori_shape[0] // block_size):
+            for j in range(ori_shape[1] // block_size):
+                mask_group[i, j] = 0
+                if mask_tmp[i,:,j,:][-1, 0] == neg_inf and mask_tmp[i,:,j,:][0, -1] == neg_inf:
+                    mask_group[i, j] = -1
+                elif mask_tmp[i,:,j,:][-1, 0] == neg_inf and mask_tmp[i,:,j,:][0, -1] == 0:
+                    """
+                        -inf,    0,     0 ..., 0,     0
+                        -inf, -inf,     0 ..., 0,     0
+                        -inf, -inf,  -inf ..., 0,     0                    
+                        ...
+                        -inf, -inf, -inf ..., -inf, -inf
+                    """
+                    mask_group[i, j] = 1
+                elif mask_tmp[i,:,j,:][0, -1] == neg_inf and mask_tmp[i,:,j,:][-1, 0] == 0:
+                    """
+                        0, -inf, -inf ..., -inf, -inf
+                        0,    0, -inf ..., -inf, -inf
+                        0,    0,    0 ..., -inf, -inf                  
+                        ...
+                        0,    0,    0    ..., 0,   0
+                    """
+                    mask_group[i, j] = 2
+        return mask_group
+
+    def matmul_kqv_idense(self, input: torch.Tensor, weight: torch.Tensor):
+        # input is kv_s   # weight is v
+        weight = weight.transpose(2, 3).contiguous().transpose(2, 3)
+        shuffleshape = list(input.shape)
+        shuffleshape[-2] = (shuffleshape[-2] + 7) // 8 * 8
+        shuffleTmp = torch.zeros(shuffleshape, dtype=input.dtype, device=input.device)
+        outshape = list(input.shape)
+        outshape[-1] = weight.shape[-1]
+        output = torch.zeros(outshape, dtype=input.dtype, device=input.device)
+        
+        input = input.contiguous()
+
+        torch.ops.torch_ipex.esimd_kernel_uni(
+            input, weight, shuffleTmp, output, output, output, output, output, output, output,  # in, weight, shuffle, out
+            1004, input.shape[-2], weight.shape[-1], shuffleshape[-1], 0, 0, 0, 0, 0, 0,   # opflag, m, n, k
+            1.0, 1.0, 1.0, 1.0, 1.0)   # weight.shape[-1] must be 128
+        
+        # torch.xpu.synchronize()
+        # torch.xpu.empty_cache()
+        # breakpoint()  # YC DBG!!!!
+
+        return output
+    
+    def minfer_sdp(self, q_state: torch.Tensor, k_state: torch.Tensor, v_state: torch.Tensor, mask: torch.Tensor):
+        
+        v_state = v_state.transpose(2, 3).contiguous().transpose(2, 3)
+        # k_state = k_state.transpose(1, 2).contiguous().transpose(1, 2)
+        outshape = list(q_state.transpose(1, 2).shape)
+        output = torch.zeros(outshape, dtype=q_state.dtype, device=q_state.device)
+        # output = torch.zeros(outshape, dtype=torch.float32, device=q_state.device)
+        output = output.transpose(1, 2)
+
+        sparse = False
+        sparseFlag = 0
+        if sparse is True:
+            mask = self.sparseMask
+            sparseFlag = 999
+        else:
+            mask = mask.to(torch.float32)
+        # breakpoint()
+            
+        # import time
+        # torch.xpu.synchronize()
+        # st=time.time()
+        # for i in range(100):
+        torch.ops.torch_ipex.esimd_kernel_uni(
+            q_state, k_state, v_state, mask, self.upperMask, self.downMask, output, output, output, output,  # q, k, v, mask
+            1005, q_state.shape[-2], q_state.shape[-2], k_state.shape[-1], k_state.shape[-2], 
+            sparseFlag, # [flag0 normal mask, flag999 sparse mask] # opflag, m, n, k, vstride, 
+            0, 0, 0, 0,   
+            1.0, 1.0, 1.0, 1.0, 1.0)   # weight.shape[-1] must be 128
+        # torch.xpu.synchronize()
+        # et=time.time()
+        # latency = (et-st)
+        # print("SDP kernel latency: %.3f sec." % latency)
+        # output = output.to(torch.float16)
+
+        # torch.xpu.synchronize()
+        # torch.xpu.empty_cache()
+        # breakpoint()  # YC DBG!!!!
+
+        return output
 
     # Adapted from LlamaAttention.forward
     def forward(
@@ -611,9 +716,13 @@ class LlamaSdpaAttention(LlamaAttention):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
+        # print("================================================")
+        # print(hidden_states)
 
         bsz, q_len, _ = hidden_states.size()
-
+        self.total_tokens_ypx = q_len if q_len != 1 else self.total_tokens_ypx + 1
+        # print("--- total_len: ", self.total_tokens_ypx)
+        # print("--- hidden_states: ", hidden_states.shape, hidden_states.stride())
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -634,13 +743,35 @@ class LlamaSdpaAttention(LlamaAttention):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        # flushXPU() # YC dbg
+        # del hidden_states
+        flushXPU() # YC dbg
+        # breakpoint()
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        enable_opt = True
+        if q_len == 1 or not enable_opt:
+            if past_key_value is not None:
+                # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # if q_len != 1:
+        #     past_key_value.temp_cleanup(self.layer_idx, cache_kwargs)
+            # flushXPU() # YC dbg
+
+        # flushXPU() # YC dbg
+        # del key_states
+        # del value_states
+        flushXPU() # YC dbg
+
+        if q_len == 1 or not enable_opt:
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # flushXPU() # YC dbg
+        # del key_states1
+        # del value_states1
+        flushXPU() # YC dbg
 
         causal_mask = attention_mask
         if attention_mask is not None:
@@ -648,29 +779,196 @@ class LlamaSdpaAttention(LlamaAttention):
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and causal_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
+        # if query_states.device.type == "cuda" and causal_mask is not None:
+        #     query_states = query_states.contiguous()
+        #     key_states = key_states.contiguous()
+        #     value_states = value_states.contiguous()
 
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
         is_causal = True if causal_mask is None and q_len > 1 else False
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=causal_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-        )
+        # print("--- key_states: ", key_states.shape, key_states.stride())
+        # print("--- value_states: ", value_states.shape, value_states.stride())
+        # print("--- query_states: ", query_states.shape, query_states.stride())
+        # attn_output = torch.nn.functional.scaled_dot_product_attention(
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attn_mask=causal_mask,
+        #     dropout_p=self.attention_dropout if self.training else 0.0,
+        #     is_causal=is_causal,
+        # )
+
+        ## PX debug
+        if self.layer_idx == 0:
+            init_size = 4096
+            local_size = 4096
+            # init_size_2 = 6144
+            if q_len == 1:
+                #self.kv_len += 1  # 2+ still window
+                # breakpoint()
+                #causal_mask[:,:,:,init_size:-local_size+self.kv_len] = -65504.0
+                print("causal_mask shape is: ", causal_mask.shape)
+                pass
+            else:
+                self.kv_len = q_len
+                for i in range(causal_mask.shape[-2]):
+                    if i >= init_size + local_size:
+                        # breakpoint()
+                        pass
+                        causal_mask[:,:,i,init_size:i+1-local_size] = -65504.0
+                        # print(i, " ", init_size, " ", -local_size-(causal_mask.shape[-1]-(i+1)))
+                # for i in range(causal_mask.shape[-2]):
+                #     if i >= init_size + 12288 and i < init_size + 12288 + init_size_2:
+                #         causal_mask[:,:,i,init_size + 12288:i+1] = 0.0
+                #     if i >= init_size + 12288 + init_size_2:
+                #         causal_mask[:,:,i,init_size + 12288:init_size + 12288 + init_size_2] = 0.0
+                print("causal_mask shape is: ", causal_mask.shape)
+
+                print("preparing sparseMasks")
+                #past_key_value.sparseMask = self.get_grouped_mask(causal_mask[0][0], 16, -65504.0)
+                print("preparing sparseMasks done!!")
+                past_key_value.upperMask = torch.zeros((16, 16), dtype=torch.float32, device=causal_mask.device)
+                past_key_value.downMask = torch.zeros((16, 16), dtype=torch.float32, device=causal_mask.device)
+                for idx in range(16):
+                    past_key_value.upperMask[idx,:idx+1] = -65504.0
+                    past_key_value.downMask[idx,idx+1:] = -65504.0
+                
+        self.sparseMask = past_key_value.sparseMask
+        self.upperMask = past_key_value.upperMask
+        self.downMask = past_key_value.downMask
+                        
+        # print(causal_mask.shape)
+        # breakpoint()
+
+        flushXPU() # YC dbg
+
+        # value_states1[0] = 1
+        # value_states[0] = 1
+
+        if q_len != 1:
+            if enable_opt:
+                # query_states = torch.load("query_states.pt")
+                # key_states1 = torch.load("key_states1.pt")
+                # value_states1 = torch.load("value_states1.pt")
+                # causal_mask = torch.load("causal_mask.pt")
+                # causal_mask[0] = 0
+                if query_states.shape[-2] % 16 != 0:
+                    print("query_states.shape[-2] = ", query_states.shape[-2], " is not 16 aligned!!! SDP has limitation")
+                    breakpoint()
+                # key_states1[0] = 1
+                # value_states1[0] = 1
+                attn_output = self.minfer_sdp(query_states, key_states, value_states, causal_mask)
+                # breakpoint()
+                print(attn_output.shape)
+                print(attn_output)
+                if past_key_value is not None:
+                    # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                    past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            else:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=causal_mask,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    is_causal=is_causal,
+                )
+                print(attn_output.shape)
+                print(attn_output)
+            # else:
+            #     # torch.save(causal_mask, "causal_mask.pt")
+            #     qk = torch.matmul(query_states, key_states.transpose(2,3))
+
+            #     # flushXPU() # YC dbg
+            #     # del key_states
+            #     flushXPU() # YC dbg
+
+            #     qk = qk / math.sqrt(query_states.size(-1))
+
+            #     # flushXPU() # YC dbg
+            #     # del query_states
+            #     flushXPU() # YC dbg
+
+            #     qk_s = qk + causal_mask
+
+            #     # flushXPU() # YC dbg
+            #     # del causal_mask
+            #     flushXPU() # YC dbg
+
+            #     # qk_s = torch.softmax(qk_s, dim=-1)
+            #     # inplace softmax
+            #     qk_masked_max, _ = torch.max(qk_s, -1)
+            #     qk_s -= qk_masked_max.unsqueeze(-1)
+            #     torch.exp(qk_s, out=qk_s)
+
+            #     # flushXPU() # YC dbg
+            #     # del qk_masked_max
+            #     flushXPU() # YC dbg
+
+            #     summed = torch.sum(qk_s, dim=-1, keepdim=True)
+            #     qk_s /= summed
+
+            #     # flushXPU() # YC dbg
+            #     # del summed
+            #     flushXPU() # YC dbg
+                
+            #     if q_len != 1 and enable_opt:
+            #         attn_out_1 = self.matmul_kqv_idense(qk_s, value_states1)
+            #     else:
+            #         attn_out_1 = torch.matmul(qk_s, value_states)
+
+            #     #breakpoint()
+
+            #     # flushXPU() # YC dbg
+            #     # del qk_s
+            #     # del value_states
+            #     flushXPU() # YC dbg
+            #     attn_output = attn_out_1
+
+            #     if q_len != 1:
+            #         print(attn_output.shape)
+            #         print(attn_output)
+
+            # past_key_value.temp_cleanup(self.layer_idx, cache_kwargs)
+            # flushXPU() # YC dbg
+
+            # if self.layer_idx == 31 and q_len != 1:
+            #     for idx in range(32):
+            #         past_key_value.temp_revive(idx, cache_kwargs)
+            #         flushXPU() # YC dbg
+        else:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=causal_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+            )
+
 
         attn_output = attn_output.transpose(1, 2).contiguous()
+
+        flushXPU() # YC dbg
+
         attn_output = attn_output.view(bsz, q_len, -1)
 
         attn_output = self.o_proj(attn_output)
 
+        flushXPU() # YC dbg
+
+        if q_len != 1:
+            print("atten done, layer =", self.layer_idx)
+        
+        if self.layer_idx == 31:
+            self.cnt += 1
+            print("generate tokens = ", self.cnt)
+
+        # print(attn_output)
+        # print("---------------------------------")
         return attn_output, None, past_key_value
 
 
@@ -747,8 +1045,16 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        flushXPU() # YC dbg
+
         hidden_states = self.mlp(hidden_states)
+
+        flushXPU() # YC dbg
+
         hidden_states = residual + hidden_states
+
+        flushXPU() # YC dbg
 
         outputs = (hidden_states,)
 
@@ -1205,8 +1511,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
-            logits = self.lm_head(hidden_states)
+            logits = self.lm_head(hidden_states[..., -1:, :])
         logits = logits.float()
+        # logits_single_token = logits[..., -1:, :].float()
+        # breakpoint()
 
         loss = None
         if labels is not None:
