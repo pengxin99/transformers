@@ -1020,6 +1020,10 @@ class StaticCache(Cache):
 
         # YC dbg
         # self.max_cache_len = (self.max_cache_len + 511) // 512 * 512  # 512 align for cacheline
+        self.max_new_tokens = 128
+        self.sparsed_cache_len = 128 + 4096
+        phy_max_cache_len = self.max_new_tokens + self.sparsed_cache_len
+        self.skipped_sparsed_cache_len = self.max_cache_len - phy_max_cache_len
 
         # Some model define a custom `head_dim` != config.hidden_size // config.num_attention_heads
         self.head_dim = (
@@ -1035,6 +1039,10 @@ class StaticCache(Cache):
         self.value_cache: List[torch.Tensor] = []
         # Note: There will be significant perf decrease if switching to use 5D tensors instead.
         cache_shape = (max_batch_size, self.num_key_value_heads, self.max_cache_len, self.head_dim)
+
+        # YC dbg
+        cache_shape = (max_batch_size, self.num_key_value_heads, phy_max_cache_len, self.head_dim)
+
         for idx in range(config.num_hidden_layers):
             # YC dbg
             new_layer_key_cache = torch.zeros(cache_shape, dtype=self.dtype, device=device)

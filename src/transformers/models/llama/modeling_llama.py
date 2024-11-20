@@ -96,8 +96,6 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
         causal_mask = attention_mask
     else:
-        if sequence_length == 1:
-            breakpoint()
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
         if sequence_length != 1:
             causal_mask = torch.triu(causal_mask, diagonal=1)
@@ -665,7 +663,7 @@ class LlamaSdpaAttention(LlamaAttention):
             sparseFlag = 999
         else:
             mask = mask.to(torch.float32)
-            
+
         # import time
         # torch.xpu.synchronize()
         # st=time.time()
@@ -751,9 +749,16 @@ class LlamaSdpaAttention(LlamaAttention):
         enable_opt = True
         if q_len == 1 or not enable_opt:
             if past_key_value is not None:
-                # sin and cos are specific to RoPE models; cache_position needed for the static cache
-                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                if q_len == 1:
+                    cache_position_updated = cache_position.clone()
+                    cache_position_updated[0] -= past_key_value.skipped_sparsed_cache_len
+                    # print("---- cache_position, cache_position_updated: ", cache_position, cache_position_updated)
+                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position_updated}
+                    key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                else:
+                    # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                    key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # if q_len != 1:
         #     past_key_value.temp_cleanup(self.layer_idx, cache_kwargs)
@@ -801,14 +806,16 @@ class LlamaSdpaAttention(LlamaAttention):
         # )
 
         ## PX debug
+        init_size = 128
+        local_size = 4096
+
         if self.layer_idx == 0:
-            init_size = 128
-            local_size = 4096
             # init_size_2 = 6144
             if q_len == 1:
                 self.kv_len += 1  # 2+ still window
-                # breakpoint()
-                causal_mask[:,:,:,init_size:-local_size+self.kv_len] = -65504.0
+
+                # causal_mask[:,:,:,init_size:-local_size+self.kv_len] = -65504.0
+                causal_mask[:,:,:,(self.kv_len - past_key_value.skipped_sparsed_cache_len):] = -65504.0
                 print("causal_mask shape is: ", causal_mask.shape)
                 pass
             else:
@@ -889,8 +896,16 @@ class LlamaSdpaAttention(LlamaAttention):
                 # print(attn_output)
                 if past_key_value is not None:
                     # sin and cos are specific to RoPE models; cache_position needed for the static cache
-                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                    past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                    k_out = past_key_value.key_cache[self.layer_idx]
+                    v_out = past_key_value.value_cache[self.layer_idx]
+
+                    k_out[..., :init_size,:] = key_states[..., :init_size,:]
+                    k_out[..., init_size:init_size+local_size,:] = key_states[..., -local_size:,:] 
+                    v_out[..., :init_size,:] = value_states[..., :init_size,:]
+                    v_out[..., init_size:init_size+local_size,:] = value_states[..., -local_size:,:] 
+
+                    # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                    # past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             else:
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
                     query_states,
@@ -964,7 +979,6 @@ class LlamaSdpaAttention(LlamaAttention):
             #         past_key_value.temp_revive(idx, cache_kwargs)
             #         flushXPU() # YC dbg
         else:
-            breakpoint()
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
