@@ -1083,6 +1083,7 @@ class StaticCache(Cache):
         Return:
             A tuple containing the updated key and value states.
         """
+        # breakpoint()
         cache_position = cache_kwargs.get("cache_position")
         k_out = self.key_cache[layer_idx]
         v_out = self.value_cache[layer_idx]

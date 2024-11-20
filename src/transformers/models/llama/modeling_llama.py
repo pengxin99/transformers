@@ -56,9 +56,9 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 
 # YC dbg
 def flushXPU():
-    pass
-    # torch.xpu.synchronize()
-    # torch.xpu.empty_cache()
+    # pass
+    torch.xpu.synchronize()
+    torch.xpu.empty_cache()
 
 def _prepare_4d_causal_attention_mask_with_cache_position(
     attention_mask: torch.Tensor,
@@ -96,6 +96,8 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
         causal_mask = attention_mask
     else:
+        if sequence_length == 1:
+            breakpoint()
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
         if sequence_length != 1:
             causal_mask = torch.triu(causal_mask, diagonal=1)
@@ -597,7 +599,7 @@ class LlamaSdpaAttention(LlamaAttention):
         kv_aligned_len = ((ori_shape[1] // block_size)+31)//32*32
         q_len = ori_shape[0] // block_size
         mask_group = torch.zeros((q_len, kv_aligned_len), dtype=torch.int8, device=mask.device) - 1
-    
+
         mask_tmp = mask.view(ori_shape[0] // block_size , block_size, ori_shape[1] // block_size, block_size)
         for i in range(ori_shape[0] // block_size):
             for j in range(ori_shape[1] // block_size):
@@ -656,14 +658,13 @@ class LlamaSdpaAttention(LlamaAttention):
         # output = torch.zeros(outshape, dtype=torch.float32, device=q_state.device)
         output = output.transpose(1, 2)
 
-        sparse = False
+        sparse = True
         sparseFlag = 0
         if sparse is True:
             mask = self.sparseMask
             sparseFlag = 999
         else:
             mask = mask.to(torch.float32)
-        # breakpoint()
             
         # import time
         # torch.xpu.synchronize()
@@ -681,8 +682,7 @@ class LlamaSdpaAttention(LlamaAttention):
         # print("SDP kernel latency: %.3f sec." % latency)
         # output = output.to(torch.float16)
 
-        # torch.xpu.synchronize()
-        # torch.xpu.empty_cache()
+        flushXPU()
         # breakpoint()  # YC DBG!!!!
 
         return output
@@ -802,13 +802,13 @@ class LlamaSdpaAttention(LlamaAttention):
 
         ## PX debug
         if self.layer_idx == 0:
-            init_size = 4096
+            init_size = 128
             local_size = 4096
             # init_size_2 = 6144
             if q_len == 1:
-                #self.kv_len += 1  # 2+ still window
+                self.kv_len += 1  # 2+ still window
                 # breakpoint()
-                #causal_mask[:,:,:,init_size:-local_size+self.kv_len] = -65504.0
+                causal_mask[:,:,:,init_size:-local_size+self.kv_len] = -65504.0
                 print("causal_mask shape is: ", causal_mask.shape)
                 pass
             else:
@@ -827,14 +827,38 @@ class LlamaSdpaAttention(LlamaAttention):
                 print("causal_mask shape is: ", causal_mask.shape)
 
                 print("preparing sparseMasks")
-                #past_key_value.sparseMask = self.get_grouped_mask(causal_mask[0][0], 16, -65504.0)
-                print("preparing sparseMasks done!!")
+                import time
+                tic = time.time()
+                # past_key_value.sparseMask = self.get_grouped_mask(causal_mask[0][0], 16, -65504.0)
+                print("preparing sparseMasks done!!, time: ", time.time() - tic)
+                # PX debug
+                print("preparing sparseMasks xpu")
+                tic = time.time()
+                ori_shape = causal_mask[0][0].shape
+                ori_stride = causal_mask[0][0].stride()
+                _INF = -65504.0
+                block_size = 16
+                kv_aligned_len = ((ori_shape[1] // block_size)+31)//32*32
+                
+                mask_g_xpu = torch.zeros((ori_shape[0] // block_size, kv_aligned_len), dtype=torch.int8, device=causal_mask.device) - 5
+                torch.ops.torch_ipex.esimd_kernel_uni(causal_mask[0][0], mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, 
+                                          1006, ori_shape[0], ori_shape[1], ori_stride[0], mask_g_xpu.shape[0], mask_g_xpu.shape[1], block_size, 1, 1, 1,
+                                           _INF, 1.0, 1.0, 1.0, 1.0)
+                torch.xpu.synchronize()
+                print("preparing sparseMasks xpu done!!, time: ", time.time() - tic)
+                # if torch.equal(past_key_value.sparseMask, mask_g_xpu):
+                #     print("--- group mask kernel pass")
+                # else:
+                #     print("--- group mask kernel failed")
+                #     breakpoint()
+
+                past_key_value.sparseMask = mask_g_xpu
                 past_key_value.upperMask = torch.zeros((16, 16), dtype=torch.float32, device=causal_mask.device)
                 past_key_value.downMask = torch.zeros((16, 16), dtype=torch.float32, device=causal_mask.device)
                 for idx in range(16):
                     past_key_value.upperMask[idx,:idx+1] = -65504.0
                     past_key_value.downMask[idx,idx+1:] = -65504.0
-                
+
         self.sparseMask = past_key_value.sparseMask
         self.upperMask = past_key_value.upperMask
         self.downMask = past_key_value.downMask
@@ -861,8 +885,8 @@ class LlamaSdpaAttention(LlamaAttention):
                 # value_states1[0] = 1
                 attn_output = self.minfer_sdp(query_states, key_states, value_states, causal_mask)
                 # breakpoint()
-                print(attn_output.shape)
-                print(attn_output)
+                # print(attn_output.shape)
+                # print(attn_output)
                 if past_key_value is not None:
                     # sin and cos are specific to RoPE models; cache_position needed for the static cache
                     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -940,6 +964,7 @@ class LlamaSdpaAttention(LlamaAttention):
             #         past_key_value.temp_revive(idx, cache_kwargs)
             #         flushXPU() # YC dbg
         else:
+            breakpoint()
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
