@@ -56,9 +56,9 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 
 # YC dbg
 def flushXPU():
-    # pass
-    torch.xpu.synchronize()
-    torch.xpu.empty_cache()
+    pass
+    # torch.xpu.synchronize()
+    # torch.xpu.empty_cache()
 
 def _prepare_4d_causal_attention_mask_with_cache_position(
     attention_mask: torch.Tensor,
@@ -92,8 +92,12 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         batch_size (`torch.Tensor`):
             Batch size.
     """
+
     if attention_mask is not None and attention_mask.dim() == 4:
         # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
+        causal_mask = attention_mask
+    ## Px debug for no mask in 1st token
+    elif sequence_length != 1:
         causal_mask = attention_mask
     else:
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
@@ -311,9 +315,25 @@ class LlamaMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            use_batch_mlp = False
+            if not use_batch_mlp:
+                down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+                return down_proj
+            else:
+                # px debug
+                gate_proj_32k = None
+                up_proj_32k = None
 
-        return down_proj
+                for i in range(4):
+                    gate_proj_32k = self.gate_proj(x[:,32*1024*i:32*1024*(i+1),:])
+                    up_proj_32k = self.up_proj(x[:,32*1024*i:32*1024*(i+1),:])
+
+                    x[:,32*1024*i:32*1024*(i+1),:] = self.down_proj(self.act_fn(gate_proj_32k) * up_proj_32k)
+
+                del gate_proj_32k, up_proj_32k
+                flushXPU()
+
+                return x
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -583,6 +603,9 @@ class LlamaFlashAttention2(LlamaAttention):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+import time
+# px time show
+show_time = False
 
 class LlamaSdpaAttention(LlamaAttention):
     """
@@ -668,6 +691,7 @@ class LlamaSdpaAttention(LlamaAttention):
         # torch.xpu.synchronize()
         # st=time.time()
         # for i in range(100):
+        # breakpoint()
         torch.ops.torch_ipex.esimd_kernel_uni(
             q_state, k_state, v_state, mask, self.upperMask, self.downMask, output, output, output, output,  # q, k, v, mask
             1005, q_state.shape[-2], q_state.shape[-2], k_state.shape[-1], k_state.shape[-2], 
@@ -721,14 +745,24 @@ class LlamaSdpaAttention(LlamaAttention):
         self.total_tokens_ypx = q_len if q_len != 1 else self.total_tokens_ypx + 1
         # print("--- total_len: ", self.total_tokens_ypx)
         # print("--- hidden_states: ", hidden_states.shape, hidden_states.stride())
+        import time
+        if show_time:
+            tic = time.time()
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("\tq,k,v proj time: ", toc - tic)
+
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        tic = time.time()
         if position_embeddings is None:
             logger.warning_once(
                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
@@ -739,13 +773,25 @@ class LlamaSdpaAttention(LlamaAttention):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # breakpoint()
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        cos = cos.contiguous()
+        sin = sin.contiguous()
+        torch.ops.torch_ipex.esimd_kernel_uni(query_states, key_states, cos, sin, query_states, query_states, query_states, query_states, query_states, query_states,
+            1010, self.num_heads, self.head_dim, self.num_key_value_heads, self.head_dim, q_len, 1, 1, 1, 1,
+            1.0, 1.0, 1.0, 1.0, 1.0)
 
-        # flushXPU() # YC dbg
-        # del hidden_states
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("\tpos emb time: ", toc - tic)
+
+        flushXPU() # YC dbg
+        del hidden_states
         flushXPU() # YC dbg
         # breakpoint()
 
+        tic = time.time()
         enable_opt = True
         if q_len == 1 or not enable_opt:
             if past_key_value is not None:
@@ -759,6 +805,11 @@ class LlamaSdpaAttention(LlamaAttention):
                     # sin and cos are specific to RoPE models; cache_position needed for the static cache
                     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("\tupdate kv cache time: ", toc - tic)
 
         # if q_len != 1:
         #     past_key_value.temp_cleanup(self.layer_idx, cache_kwargs)
@@ -779,7 +830,10 @@ class LlamaSdpaAttention(LlamaAttention):
         flushXPU() # YC dbg
 
         causal_mask = attention_mask
-        if attention_mask is not None:
+
+        ## Px debug for no mask in 1st token
+        # if attention_mask is not None:
+        if attention_mask is not None and q_len == 1:
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
@@ -807,8 +861,8 @@ class LlamaSdpaAttention(LlamaAttention):
 
         ## PX debug
         init_size = 128
-        local_size = 4096
-
+        local_size = 4096 - 16
+        tic = time.time()
         if self.layer_idx == 0:
             # init_size_2 = 6144
             if q_len == 1:
@@ -816,43 +870,52 @@ class LlamaSdpaAttention(LlamaAttention):
 
                 # causal_mask[:,:,:,init_size:-local_size+self.kv_len] = -65504.0
                 causal_mask[:,:,:,(self.kv_len - past_key_value.skipped_sparsed_cache_len):] = -65504.0
-                print("causal_mask shape is: ", causal_mask.shape)
+                # print("causal_mask shape is: ", causal_mask.shape)
                 pass
             else:
                 self.kv_len = q_len
-                for i in range(causal_mask.shape[-2]):
-                    if i >= init_size + local_size:
-                        # breakpoint()
-                        pass
-                        causal_mask[:,:,i,init_size:i+1-local_size] = -65504.0
+                ## Px debug for no mask in 1st token
+                # for i in range(causal_mask.shape[-2]):
+                #     if i >= init_size + local_size:
+                #         # breakpoint()
+                #         pass
+                #         causal_mask[:,:,i,init_size:i+1-local_size] = -65504.0
                         # print(i, " ", init_size, " ", -local_size-(causal_mask.shape[-1]-(i+1)))
                 # for i in range(causal_mask.shape[-2]):
                 #     if i >= init_size + 12288 and i < init_size + 12288 + init_size_2:
                 #         causal_mask[:,:,i,init_size + 12288:i+1] = 0.0
                 #     if i >= init_size + 12288 + init_size_2:
                 #         causal_mask[:,:,i,init_size + 12288:init_size + 12288 + init_size_2] = 0.0
-                print("causal_mask shape is: ", causal_mask.shape)
+                # print("causal_mask shape is: ", causal_mask.shape)
 
                 print("preparing sparseMasks")
-                import time
-                tic = time.time()
+                # import time
+                # tic = time.time()
                 # past_key_value.sparseMask = self.get_grouped_mask(causal_mask[0][0], 16, -65504.0)
-                print("preparing sparseMasks done!!, time: ", time.time() - tic)
+                # print("preparing sparseMasks done!!, time: ", time.time() - tic)
                 # PX debug
-                print("preparing sparseMasks xpu")
-                tic = time.time()
-                ori_shape = causal_mask[0][0].shape
-                ori_stride = causal_mask[0][0].stride()
+                # print("preparing sparseMasks xpu")
+                # tic = time.time()
+
+                ori_shape = (q_len, q_len)   #causal_mask[0][0].shape
+                ori_stride = (q_len, 1)  #causal_mask[0][0].stride()
                 _INF = -65504.0
                 block_size = 16
                 kv_aligned_len = ((ori_shape[1] // block_size)+31)//32*32
                 
                 mask_g_xpu = torch.zeros((ori_shape[0] // block_size, kv_aligned_len), dtype=torch.int8, device=causal_mask.device) - 5
-                torch.ops.torch_ipex.esimd_kernel_uni(causal_mask[0][0], mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, 
-                                          1006, ori_shape[0], ori_shape[1], ori_stride[0], mask_g_xpu.shape[0], mask_g_xpu.shape[1], block_size, 1, 1, 1,
-                                           _INF, 1.0, 1.0, 1.0, 1.0)
-                torch.xpu.synchronize()
-                print("preparing sparseMasks xpu done!!, time: ", time.time() - tic)
+                # torch.ops.torch_ipex.esimd_kernel_uni(causal_mask[0][0], mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu,
+                #                           1006, ori_shape[0], ori_shape[1], ori_stride[0], mask_g_xpu.shape[0], mask_g_xpu.shape[1], block_size, 1, 1, 1,
+                #                            _INF, 1.0, 1.0, 1.0, 1.0)
+                torch.ops.torch_ipex.esimd_kernel_uni(mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu,
+                    1007, ori_shape[0], ori_shape[1], ori_stride[0], mask_g_xpu.shape[0], mask_g_xpu.shape[1], block_size, init_size, local_size, 1,
+                    _INF, 1.0, 1.0, 1.0, 1.0)
+
+                if show_time:
+                    torch.xpu.synchronize()
+                    # breakpoint()
+                    print("preparing sparseMasks xpu done!!, time: ", time.time() - tic)
+
                 # if torch.equal(past_key_value.sparseMask, mask_g_xpu):
                 #     print("--- group mask kernel pass")
                 # else:
@@ -869,7 +932,12 @@ class LlamaSdpaAttention(LlamaAttention):
         self.sparseMask = past_key_value.sparseMask
         self.upperMask = past_key_value.upperMask
         self.downMask = past_key_value.downMask
-                        
+
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("\tmask gen time: ", toc - tic)
+
         # print(causal_mask.shape)
         # breakpoint()
 
@@ -879,21 +947,31 @@ class LlamaSdpaAttention(LlamaAttention):
         # value_states[0] = 1
 
         if q_len != 1:
+
             if enable_opt:
                 # query_states = torch.load("query_states.pt")
                 # key_states1 = torch.load("key_states1.pt")
                 # value_states1 = torch.load("value_states1.pt")
                 # causal_mask = torch.load("causal_mask.pt")
                 # causal_mask[0] = 0
+                if show_time:
+                    torch.xpu.synchronize()
+                    tic = time.time()
+
                 if query_states.shape[-2] % 16 != 0:
                     print("query_states.shape[-2] = ", query_states.shape[-2], " is not 16 aligned!!! SDP has limitation")
                     breakpoint()
                 # key_states1[0] = 1
                 # value_states1[0] = 1
                 attn_output = self.minfer_sdp(query_states, key_states, value_states, causal_mask)
+                # attn_output = query_states
                 # breakpoint()
                 # print(attn_output.shape)
                 # print(attn_output)
+                if show_time:
+                    torch.xpu.synchronize()
+                    toc = time.time()
+                    print("\tsdpa time: ", toc - tic)
                 if past_key_value is not None:
                     # sin and cos are specific to RoPE models; cache_position needed for the static cache
                     k_out = past_key_value.key_cache[self.layer_idx]
@@ -978,6 +1056,7 @@ class LlamaSdpaAttention(LlamaAttention):
             #     for idx in range(32):
             #         past_key_value.temp_revive(idx, cache_kwargs)
             #         flushXPU() # YC dbg
+
         else:
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
@@ -993,14 +1072,20 @@ class LlamaSdpaAttention(LlamaAttention):
 
         flushXPU() # YC dbg
 
+        if show_time:
+            tic = time.time()
         attn_output = attn_output.view(bsz, q_len, -1)
-
         attn_output = self.o_proj(attn_output)
+
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("\tout proj time: ", toc - tic)
 
         flushXPU() # YC dbg
 
         if q_len != 1:
-            print("atten done, layer =", self.layer_idx)
+            print("---------------- atten done, layer =", self.layer_idx)
         
         if self.layer_idx == 31:
             self.cnt += 1
@@ -1063,10 +1148,27 @@ class LlamaDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
+        import time
         residual = hidden_states
+
+        if show_time:
+            ic = time.time()
 
         hidden_states = self.input_layernorm(hidden_states)
 
+        # torch.ops.torch_ipex.esimd_kernel_uni(self.input_layernorm.weight, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, 
+        #     1008, hidden_states.shape[-1], hidden_states.shape[1], 1, 1, 1, 1, 1, 1, 1,
+        #     self.input_layernorm.variance_epsilon, 1.0, 1.0, 1.0, 1.0)
+        # # PX WR for the nan in FP16 layernorm
+        # if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
+        #     torch.nan_to_num(hidden_states, nan=0.0001, posinf=65504.0, neginf=-65504.0)
+
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("input_layernor time: ", toc - tic)
+
+        tic = time.time()
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -1081,16 +1183,35 @@ class LlamaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("sdpa all time: ", toc - tic)
+
         # Fully Connected
+        tic = time.time()
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        # torch.ops.torch_ipex.esimd_kernel_uni(self.post_attention_layernorm.weight, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, 
+        #     1008, hidden_states.shape[-1], hidden_states.shape[1], 1, 1, 1, 1, 1, 1, 1,
+        #     self.post_attention_layernorm.variance_epsilon, 1.0, 1.0, 1.0, 1.0)
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("post_att_layernor time: ", toc - tic)
 
         flushXPU() # YC dbg
 
+        tic = time.time()
         hidden_states = self.mlp(hidden_states)
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("mlp time: ", toc - tic)
 
         flushXPU() # YC dbg
 
+        tic = time.time()
         hidden_states = residual + hidden_states
 
         flushXPU() # YC dbg
@@ -1102,6 +1223,11 @@ class LlamaDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+
+        if show_time:
+            torch.xpu.synchronize()
+            toc = time.time()
+            print("residual add time: ", toc - tic)
 
         return outputs
 
@@ -1545,6 +1671,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
 
         hidden_states = outputs[0]
+        # tic = time.time()
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
@@ -1554,7 +1681,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         logits = logits.float()
         # logits_single_token = logits[..., -1:, :].float()
         # breakpoint()
+        # torch.xpu.synchronize()
+        # toc = time.time()
+        # print("lm_head time: ", toc - tic)
 
+        tic = time.time()
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
@@ -1572,13 +1703,18 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        final_output =  CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+        # torch.xpu.synchronize()
+        # toc = time.time()
+        # print("after lm_head time: ", toc - tic)
+        return final_output
 
     def prepare_inputs_for_generation(
         self,
