@@ -1013,17 +1013,17 @@ class StaticCache(Cache):
         ```
     """
 
-    def __init__(self, config: PretrainedConfig, max_batch_size: int, max_cache_len: int, device, dtype=None) -> None:
+    def __init__(self, config: PretrainedConfig, max_batch_size: int, max_cache_len: int, input_len: int, device, dtype=None, ) -> None:
         super().__init__()
         self.max_batch_size = max_batch_size
         self.max_cache_len = config.max_position_embeddings if max_cache_len is None else max_cache_len
 
         # YC dbg
         # self.max_cache_len = (self.max_cache_len + 511) // 512 * 512  # 512 align for cacheline
-        self.max_new_tokens = 128
-        self.sparsed_cache_len = 128 + 4096
+        self.max_new_tokens = max_cache_len - input_len
+        self.sparsed_cache_len = 128 + 4096 - 16
         phy_max_cache_len = self.max_new_tokens + self.sparsed_cache_len
-        self.skipped_sparsed_cache_len = self.max_cache_len - phy_max_cache_len
+        self.skipped_sparsed_cache_len = self.max_cache_len - phy_max_cache_len if self.max_cache_len - phy_max_cache_len else 0
 
         # Some model define a custom `head_dim` != config.hidden_size // config.num_attention_heads
         self.head_dim = (
@@ -1091,11 +1091,9 @@ class StaticCache(Cache):
         Return:
             A tuple containing the updated key and value states.
         """
-        # breakpoint()
         cache_position = cache_kwargs.get("cache_position")
         k_out = self.key_cache[layer_idx]
         v_out = self.value_cache[layer_idx]
-
         if cache_position is None:
             k_out.copy_(key_states)
             v_out.copy_(value_states)

@@ -613,6 +613,7 @@ class LlamaSdpaAttention(LlamaAttention):
     `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
     SDPA API.
     """
+
     def get_grouped_mask(self, mask, block_size, neg_inf):
         ori_shape = mask.shape
         assert(len(ori_shape) == 2)
@@ -678,23 +679,24 @@ class LlamaSdpaAttention(LlamaAttention):
         output = torch.zeros(outshape, dtype=q_state.dtype, device=q_state.device)
         # output = torch.zeros(outshape, dtype=torch.float32, device=q_state.device)
         output = output.transpose(1, 2)
-
-        sparse = True
-        sparseFlag = 0
-        if sparse is True:
+        
+        if q_state.shape[-2] <= 6 * 1024:
+            print("-------- do not use sparse atten, q_len is: ", q_state.shape[-2])
+            sparse = False
+            sparseFlag = 0
+            mask = mask.to(torch.float32)
+        else:
+            sparse = True
             mask = self.sparseMask
             sparseFlag = 999
-        else:
-            mask = mask.to(torch.float32)
 
         # import time
         # torch.xpu.synchronize()
         # st=time.time()
         # for i in range(100):
-        # breakpoint()
         torch.ops.torch_ipex.esimd_kernel_uni(
             q_state, k_state, v_state, mask, self.upperMask, self.downMask, output, output, output, output,  # q, k, v, mask
-            1005, q_state.shape[-2], q_state.shape[-2], k_state.shape[-1], k_state.shape[-2], 
+            1005, q_state.shape[-2], q_state.shape[-2], k_state.shape[-1], v_state.stride()[-1], 
             sparseFlag, # [flag0 normal mask, flag999 sparse mask] # opflag, m, n, k, vstride, 
             0, 0, 0, 0,   
             1.0, 1.0, 1.0, 1.0, 1.0)   # weight.shape[-1] must be 128
@@ -789,7 +791,7 @@ class LlamaSdpaAttention(LlamaAttention):
         flushXPU() # YC dbg
         del hidden_states
         flushXPU() # YC dbg
-        # breakpoint()
+
 
         tic = time.time()
         enable_opt = True
@@ -801,6 +803,7 @@ class LlamaSdpaAttention(LlamaAttention):
                     # print("---- cache_position, cache_position_updated: ", cache_position, cache_position_updated)
                     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position_updated}
                     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                    # print("--- cache_position, cache_position_updated: ", cache_position, cache_position_updated)
                 else:
                     # sin and cos are specific to RoPE models; cache_position needed for the static cache
                     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -865,12 +868,14 @@ class LlamaSdpaAttention(LlamaAttention):
         tic = time.time()
         if self.layer_idx == 0:
             # init_size_2 = 6144
+            # breakpoint()
             if q_len == 1:
                 self.kv_len += 1  # 2+ still window
 
                 # causal_mask[:,:,:,init_size:-local_size+self.kv_len] = -65504.0
                 causal_mask[:,:,:,(self.kv_len - past_key_value.skipped_sparsed_cache_len):] = -65504.0
                 # print("causal_mask shape is: ", causal_mask.shape)
+                # print("--- self.kv_len, self.kv_len - past_key_value.skipped_sparsed_cache_len: ", self.kv_len, self.kv_len - past_key_value.skipped_sparsed_cache_len)
                 pass
             else:
                 self.kv_len = q_len
@@ -888,7 +893,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 #         causal_mask[:,:,i,init_size + 12288:init_size + 12288 + init_size_2] = 0.0
                 # print("causal_mask shape is: ", causal_mask.shape)
 
-                print("preparing sparseMasks")
+                # print("preparing sparseMasks")
                 # import time
                 # tic = time.time()
                 # past_key_value.sparseMask = self.get_grouped_mask(causal_mask[0][0], 16, -65504.0)
@@ -901,7 +906,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 ori_stride = (q_len, 1)  #causal_mask[0][0].stride()
                 _INF = -65504.0
                 block_size = 16
-                kv_aligned_len = ((ori_shape[1] // block_size)+31)//32*32
+                kv_aligned_len = ((ori_shape[1] // block_size)+15)//16*16
                 
                 mask_g_xpu = torch.zeros((ori_shape[0] // block_size, kv_aligned_len), dtype=torch.int8, device=causal_mask.device) - 5
                 # torch.ops.torch_ipex.esimd_kernel_uni(causal_mask[0][0], mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu, mask_g_xpu,
@@ -954,25 +959,27 @@ class LlamaSdpaAttention(LlamaAttention):
                 # value_states1 = torch.load("value_states1.pt")
                 # causal_mask = torch.load("causal_mask.pt")
                 # causal_mask[0] = 0
-                if show_time:
+                if True or show_time:
                     torch.xpu.synchronize()
                     tic = time.time()
 
                 if query_states.shape[-2] % 16 != 0:
                     print("query_states.shape[-2] = ", query_states.shape[-2], " is not 16 aligned!!! SDP has limitation")
-                    breakpoint()
+                    # breakpoint()
                 # key_states1[0] = 1
                 # value_states1[0] = 1
+                # print("--- 1st q,k,v,attn_mask: ", query_states.shape, key_states.shape, value_states.shape, causal_mask.shape)
                 attn_output = self.minfer_sdp(query_states, key_states, value_states, causal_mask)
                 # attn_output = query_states
                 # breakpoint()
                 # print(attn_output.shape)
                 # print(attn_output)
-                if show_time:
+                if True or show_time:
                     torch.xpu.synchronize()
                     toc = time.time()
                     print("\tsdpa time: ", toc - tic)
                 if past_key_value is not None:
+
                     # sin and cos are specific to RoPE models; cache_position needed for the static cache
                     k_out = past_key_value.key_cache[self.layer_idx]
                     v_out = past_key_value.value_cache[self.layer_idx]
@@ -981,6 +988,10 @@ class LlamaSdpaAttention(LlamaAttention):
                     k_out[..., init_size:init_size+local_size,:] = key_states[..., -local_size:,:] 
                     v_out[..., :init_size,:] = value_states[..., :init_size,:]
                     v_out[..., init_size:init_size+local_size,:] = value_states[..., -local_size:,:] 
+                    # if(self.layer_idx == 1):
+                    #     breakpoint()
+                    #     print("--- q,k,v: ", key_states.shape, value_states.shape)
+                    #     print("--- k_cache, v_cache: ", k_out.shape, v_out.shape)
 
                     # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                     # past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -989,7 +1000,7 @@ class LlamaSdpaAttention(LlamaAttention):
                     query_states,
                     key_states,
                     value_states,
-                    attn_mask=causal_mask,
+                    attn_mask=causal_mask.to(query_states.dtype),
                     dropout_p=self.attention_dropout if self.training else 0.0,
                     is_causal=is_causal,
                 )
@@ -1058,6 +1069,10 @@ class LlamaSdpaAttention(LlamaAttention):
             #         flushXPU() # YC dbg
 
         else:
+            # if(self.layer_idx == 1):
+                # print("--- 2+ q,k,v,attn_mask: ", query_states.shape, key_states.shape, value_states.shape, causal_mask.shape)
+                # print("--- 2+ attn_mask: ", causal_mask[...,128+4096:4096+128+16])
+            # breakpoint()
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
@@ -1152,7 +1167,7 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
 
         if show_time:
-            ic = time.time()
+            tic = time.time()
 
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -1189,7 +1204,8 @@ class LlamaDecoderLayer(nn.Module):
             print("sdpa all time: ", toc - tic)
 
         # Fully Connected
-        tic = time.time()
+        if show_time:
+            tic = time.time()
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         # torch.ops.torch_ipex.esimd_kernel_uni(self.post_attention_layernorm.weight, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, hidden_states, 

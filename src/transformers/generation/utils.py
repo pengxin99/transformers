@@ -1357,6 +1357,7 @@ class GenerationMixin:
 
         # priority: `generation_config` argument > `model.generation_config` (the default generation config)
         using_model_generation_config = False
+        # breakpoint()
         if generation_config is None:
             # legacy: users may modify the model configuration to control generation. To trigger this legacy behavior,
             # three conditions must be met
@@ -1482,6 +1483,8 @@ class GenerationMixin:
                 "device": device,
                 "dtype": cache_dtype,
             }
+            # PX add to pass the real input len input the kv_cache
+            cache_kwargs['input_len'] = model_kwargs['input_len']
             self._cache = cache_cls(**cache_kwargs)
             if requires_cross_attention_cache:
                 encoder_kwargs = cache_kwargs.copy()
@@ -1685,6 +1688,7 @@ class GenerationMixin:
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         self._validate_model_class()
         tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
+        # breakpoint()
         generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
         self._validate_model_kwargs(model_kwargs.copy())
         self._validate_assistant(assistant_model)
@@ -1765,6 +1769,7 @@ class GenerationMixin:
             streamer.put(input_ids.cpu())
 
         # 6. Prepare `max_length` depending on other stopping criteria.
+        # breakpoint()
         input_ids_length = input_ids.shape[-1]
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
         has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
@@ -1814,6 +1819,8 @@ class GenerationMixin:
                         "This model does not support `cache_implementation='static'`. Please check the following "
                         "issue: https://github.com/huggingface/transformers/issues/28981"
                     )
+                # PX add to pass the real input len input the kv_cache
+                model_kwargs['input_len']=inputs_tensor.shape[-1]
                 model_kwargs[cache_name] = self._get_cache(
                     cache_implementation=generation_config.cache_implementation,
                     max_batch_size=generation_config.num_beams * generation_config.num_return_sequences * batch_size,
@@ -2011,7 +2018,6 @@ class GenerationMixin:
                 if generation_config.do_sample
                 else None
             )
-
             # 12. expand input_ids with `num_return_sequences` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
                 input_ids=input_ids,
