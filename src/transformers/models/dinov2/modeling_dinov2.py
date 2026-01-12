@@ -30,10 +30,14 @@ from ...utils import TransformersKwargs, auto_docstring, logging, torch_int
 from ...utils.backbone_utils import BackboneMixin
 from ...utils.generic import can_return_tuple, check_model_inputs
 from .configuration_dinov2 import Dinov2Config
-
+from torch.autograd import Function
 
 logger = logging.get_logger(__name__)
 
+opt_qkv_proj = False
+opt_swinattention = True
+opt_layernromv3 = True
+opt_bmm2mm = True
 
 class Dinov2Embeddings(nn.Module):
     """
@@ -179,6 +183,38 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+class CustomOp(Function):
+    @staticmethod
+    def forward(ctx, q, k, v, scale):
+        """
+        forward 实际上并不会对模型图产生任何影响，因此 forward 只需要保证在 transformers 转 onnx 的步骤时，onnx 推理出来的 shape 是对的上的
+        这里因为 SwinAttentionScore 的输出是 [B,S,H] 的shape，而 q 的shape是 [B,N,S,D]
+        """
+        q = q.transpose(1,2)
+        a, b = q.shape[:2]
+        c = q.shape[2] * q.shape[3]
+        return q.view(a, b, c), k
+    
+    @staticmethod
+    def symbolic(g: torch.Graph, query, key, value, scale, keep_prob=1.0,
+                         softmax_axes=-1, kernel_name="swin_attention_score"):
+        """
+        创建一个自定义的算子的符号
+        """
+        return g.op("Custom", query, key, value, scale, input_index_i=[0,1,2,5],
+                    input_names_s=['query', 'key', 'value', 'padding_mask1', 'padding_mask2', 'scale'], 
+                    output_names_s=['attention_score', 'softmax'],  type_s="SwinAttentionScore", outputs=2)
+
+class CustomLN(Function):
+    @staticmethod
+    def forward(ctx, x, gamma, beta, eps):
+        return x
+
+    @staticmethod
+    def symbolic(g: torch.Graph, x, gamma, beta, eps):
+        return g.op("Custom", x, gamma, beta, type_s = "LayerNormV3", begin_norm_axis_i=-1, begin_params_axis_i=-1, 
+                    epsilon_f=eps, input_names_s=["x", "gamma", "beta"], output_names_s=["y"], 
+                    output_num_i=3, op_type_s="LayerNormV3")
 
 # Copied from transformers.models.vit.modeling_vit.ViTSelfAttention with ViT->Dinov2
 class Dinov2SelfAttention(nn.Module):
@@ -208,6 +244,10 @@ class Dinov2SelfAttention(nn.Module):
         batch_size = hidden_states.shape[0]
         new_shape = batch_size, -1, self.num_attention_heads, self.attention_head_size
 
+        if opt_bmm2mm:
+            batch_size, seq_len, hidden_dim = hidden_states.shape
+            hidden_states = hidden_states.view(-1, hidden_dim)
+
         key_layer = self.key(hidden_states).view(*new_shape).transpose(1, 2)
         value_layer = self.value(hidden_states).view(*new_shape).transpose(1, 2)
         query_layer = self.query(hidden_states).view(*new_shape).transpose(1, 2)
@@ -216,16 +256,24 @@ class Dinov2SelfAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        context_layer, attention_probs = attention_interface(
-            self,
-            query_layer,
-            key_layer,
-            value_layer,
-            head_mask,
-            is_causal=self.is_causal,
-            scaling=self.scaling,
-            dropout=0.0 if not self.training else self.dropout_prob,
-        )
+        if not opt_swinattention:
+            context_layer, attention_probs = attention_interface(
+                self,
+                query_layer,
+                key_layer,
+                value_layer,
+                head_mask,
+                is_causal=self.is_causal,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.dropout_prob,
+            )
+        else:
+            context_layer, _ = CustomOp.apply(query_layer, key_layer, value_layer, torch.ones_like(query_layer) * self.scaling)
+            print("context_layer1: ", context_layer.shape)
+            a, b = context_layer[:2]
+            context_layer = context_layer.view(a, b, self.num_attention_heads, self.attention_head_size)
+            print("context_layer2: ", context_layer.shape)
+            attention_probs = None
 
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.reshape(new_context_layer_shape)
@@ -388,7 +436,11 @@ class Dinov2Layer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states_norm = self.norm1(hidden_states)
+        if not opt_layernromv3:
+            hidden_states_norm = self.norm1(hidden_states)
+        else:
+            hidden_states_norm = CustomLN.apply(hidden_states, self.norm1.weight, self.norm1.bias, self.norm1.eps)
+
         self_attention_output = self.attention(hidden_states_norm, head_mask)
         self_attention_output = self.layer_scale1(self_attention_output)
 
@@ -396,6 +448,11 @@ class Dinov2Layer(GradientCheckpointingLayer):
         hidden_states = self.drop_path(self_attention_output) + hidden_states
 
         # in Dinov2, layernorm is also applied after self-attention
+        if not opt_layernromv3:
+            hidden_states_norm = self.norm2(hidden_states)
+        else:
+            hidden_states_norm = CustomLN.apply(hidden_states, self.norm2.weight, self.norm2.bias, self.norm2.eps)
+
         layer_output = self.norm2(hidden_states)
         layer_output = self.mlp(layer_output)
         layer_output = self.layer_scale2(layer_output)
@@ -535,7 +592,12 @@ class Dinov2Model(Dinov2PreTrainedModel):
             embedding_output, head_mask=head_mask, output_hidden_states=output_hidden_states
         )
         sequence_output = encoder_outputs.last_hidden_state
-        sequence_output = self.layernorm(sequence_output)
+        
+        if not opt_layernromv3:
+            sequence_output = self.layernorm(sequence_output)
+        else:
+            sequence_output = CustomLN.apply(sequence_output, self.layernorm.weight, self.layernorm.bias, self.layernorm.eps)
+
         pooled_output = sequence_output[:, 0, :]
 
         return BaseModelOutputWithPooling(
